@@ -44,15 +44,22 @@ PERFAI_HOSTNAME="https://cloud.perfai.ai"
 fi
 
 ### Step 1: Print Access Token ###
-TOKEN_RESPONSE=$(curl -s --location --request POST "https://api.perfai.ai/api/v1/auth/token" \
+TOKEN_RESPONSE=$(curl -sS --location --request POST "https://api.perfai.ai/api/v1/auth/token" \
 --header "x-org-id: $ORG_ID" \
 --header "Content-Type: application/json" \
 --data-raw "{
     \"username\": \"${PERFAI_USERNAME}\",
     \"password\": \"${PERFAI_PASSWORD}\"
-}")
+}" 2>&1)
+CURL_EXIT=$?
 
-ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.id_token')
+if [ $CURL_EXIT -ne 0 ]; then
+    echo "Error: Failed to connect to PerfAI auth API (curl exit $CURL_EXIT): $TOKEN_RESPONSE"
+    echo "Check network connectivity and ensure api.perfai.ai is reachable from this host."
+    exit 1
+fi
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.id_token' 2>/dev/null)
 
 if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
     echo "Error: Could not retrieve access token. Auth response: $TOKEN_RESPONSE"
@@ -93,15 +100,25 @@ if [ -n "$APP_URL" ]; then
     echo "Vision Agent Task ID: $VISION_TASK_ID"
 
     if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
-        echo "Waiting for vision agent scan to complete..."
+        VISION_TIMEOUT_MINUTES=${VISION_TIMEOUT_MINUTES:-60}
+        echo "Waiting for vision agent scan to complete (timeout: ${VISION_TIMEOUT_MINUTES}m)..."
 
         VISION_STATUS="PENDING"
         VISION_LAST_SNAPSHOT=""
         VISION_EMPTY_RETRIES=0
         VISION_MAX_EMPTY_RETRIES=5
+        VISION_START_TIME=$(date +%s)
+        VISION_POLL_COUNT=0
+        VISION_HEARTBEAT_INTERVAL=10  # print a heartbeat every N polls (~5 min at 30s/poll)
 
         while [[ "$VISION_STATUS" == "PENDING" || "$VISION_STATUS" == "IN_PROGRESS" ]]; do
             sleep 30
+
+            VISION_ELAPSED=$(( ($(date +%s) - VISION_START_TIME) / 60 ))
+            if [ "$VISION_ELAPSED" -ge "$VISION_TIMEOUT_MINUTES" ]; then
+                echo "Error: Vision agent scan exceeded timeout of ${VISION_TIMEOUT_MINUTES}m. Last status: $VISION_STATUS. Aborting."
+                exit 1
+            fi
 
             VISION_STATUS_RESPONSE=$(curl -s --location --request GET \
               "https://api.perfai.ai/api/v1/vision-agent-tasks/get-task/${VISION_TASK_ID}" \
@@ -121,6 +138,7 @@ if [ -n "$APP_URL" ]; then
             fi
 
             VISION_EMPTY_RETRIES=0
+            VISION_POLL_COUNT=$((VISION_POLL_COUNT + 1))
             VISION_STATUS=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.status // empty')
 
             if [ -z "$VISION_STATUS" ] || [ "$VISION_STATUS" == "null" ]; then
@@ -132,8 +150,9 @@ if [ -n "$APP_URL" ]; then
             VISION_MESSAGE=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.message // "N/A"')
             VISION_SNAPSHOT="${VISION_STATUS}|${VISION_IS_ERROR}|${VISION_MESSAGE}"
 
-            if [ "$VISION_SNAPSHOT" != "$VISION_LAST_SNAPSHOT" ]; then
-                echo "[$(date '+%H:%M:%S')] Vision Agent Status: $VISION_STATUS | Error: $VISION_IS_ERROR | Message: $VISION_MESSAGE"
+            # Print on every status change OR as a periodic heartbeat so the log never goes silent
+            if [ "$VISION_SNAPSHOT" != "$VISION_LAST_SNAPSHOT" ] || [ $((VISION_POLL_COUNT % VISION_HEARTBEAT_INTERVAL)) -eq 0 ]; then
+                echo "[$(date '+%H:%M:%S')] Elapsed: ${VISION_ELAPSED}m | Vision Agent Status: $VISION_STATUS | Error: $VISION_IS_ERROR | Message: $VISION_MESSAGE"
                 VISION_LAST_SNAPSHOT="$VISION_SNAPSHOT"
             fi
         done
@@ -141,20 +160,48 @@ if [ -n "$APP_URL" ]; then
         if [ "$VISION_STATUS" == "COMPLETED" ]; then
             echo "Vision agent scan completed successfully."
             echo " "
-            echo "===== Vision Agent Results ====="
-            VISION_RESULTS=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.results // empty')
-            VISION_IS_ERROR_FINAL=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.isError')
-            VISION_MSG_FINAL=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.message // "none"')
-            echo "Is Error : $VISION_IS_ERROR_FINAL"
-            echo "Message  : $VISION_MSG_FINAL"
-            if [ -n "$VISION_RESULTS" ]; then
-                echo "Results  :"
-                echo "$VISION_RESULTS" | jq . 2>/dev/null || echo "$VISION_RESULTS"
+
+            ### Fetch generated OAS from vision-agent controller ###
+            echo "===== Vision Agent — Generated OAS ====="
+            OAS_RESPONSE=$(curl -s --location \
+              "https://api.perfai.ai/api/v1/vision-agent/oas/${VISION_TASK_ID}" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "x-org-id: $ORG_ID" \
+              -H "accept: application/json")
+
+            if [ -z "$OAS_RESPONSE" ] || ! echo "$OAS_RESPONSE" | jq -e . >/dev/null 2>&1; then
+                echo "Warning: could not fetch OAS. Response: $(echo "$OAS_RESPONSE" | head -1)"
             else
-                echo "Results  : (no results field returned — spec may have been saved directly to the app)"
+                ENDPOINT_COUNT=$(echo "$OAS_RESPONSE" | jq '[.paths // {} | to_entries[] | .value | to_entries[]] | length' 2>/dev/null || echo "unknown")
+                OAS_TITLE=$(echo "$OAS_RESPONSE" | jq -r '.info.title // "N/A"')
+                OAS_VERSION=$(echo "$OAS_RESPONSE" | jq -r '.info.version // "N/A"')
+                echo "Title           : $OAS_TITLE"
+                echo "Version         : $OAS_VERSION"
+                echo "Endpoints found : $ENDPOINT_COUNT"
+                echo " "
+                echo "$OAS_RESPONSE" | jq '{info: .info, paths: (.paths // {})}' 2>/dev/null || echo "$OAS_RESPONSE"
             fi
-            echo "================================"
+            echo "========================================"
             echo " "
+
+            ### Fetch step logs from vision-agent controller ###
+            echo "===== Vision Agent — Step Logs ====="
+            STEPS_RESPONSE=$(curl -s --location \
+              "https://api.perfai.ai/api/v1/vision-agent/save-captures/${VISION_TASK_ID}/steps" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "x-org-id: $ORG_ID" \
+              -H "accept: application/json")
+
+            if [ -z "$STEPS_RESPONSE" ] || ! echo "$STEPS_RESPONSE" | jq -e . >/dev/null 2>&1; then
+                echo "Warning: could not fetch step logs. Response: $(echo "$STEPS_RESPONSE" | head -1)"
+            else
+                STEP_COUNT=$(echo "$STEPS_RESPONSE" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "unknown")
+                echo "Total steps : $STEP_COUNT"
+                echo "$STEPS_RESPONSE" | jq . 2>/dev/null || echo "$STEPS_RESPONSE"
+            fi
+            echo "===================================="
+            echo " "
+
         elif [ "$VISION_STATUS" == "FAILED" ] || [ "$VISION_STATUS" == "ABORTED" ]; then
             echo "Error: Vision agent scan ended with status: $VISION_STATUS. Message: $VISION_MESSAGE"
             echo "Full response: $VISION_STATUS_RESPONSE"
@@ -226,7 +273,9 @@ RUN_RESPONSE=$(curl -s --location --request POST "https://api.perfai.ai/chain-ex
 )
 
 echo " "
-echo "Run Response: $RUN_RESPONSE"
+echo "===== Chain Execution Started ====="
+echo "$RUN_RESPONSE" | jq '{chain_execution_id, status, total_steps, created_at}' 2>/dev/null || echo "$RUN_RESPONSE"
+echo "==================================="
 echo " "
 
 CHAIN_EXECUTION_ID=$(echo "$RUN_RESPONSE" | jq -r '.chain_execution_id')
@@ -315,29 +364,71 @@ if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
 
         ### Fetch Security Issues ###
         echo "===== Security Issues ====="
-        ISSUES_RESPONSE=$(curl -s --location --request GET \
+        ISSUES_RESPONSE=$(curl -s --location \
           "https://api.perfai.ai/api/v1/sensitive-data-service/apps/all-issues-ids-security?app_id=${APP_ID}&sortBy=severity&sortOrder=DESC" \
           -H "Authorization: Bearer $ACCESS_TOKEN" \
           -H "x-org-id: $ORG_ID" \
           -H "accept: application/json")
 
-        if [ -z "$ISSUES_RESPONSE" ] || ! echo "$ISSUES_RESPONSE" | jq -e . >/dev/null 2>&1; then
-            echo "Warning: could not fetch security issues. Response: $(echo "$ISSUES_RESPONSE" | head -1)"
+        if [ -z "$ISSUES_RESPONSE" ]; then
+            echo "Warning: empty response from security issues API."
+        elif ! echo "$ISSUES_RESPONSE" | jq -e . >/dev/null 2>&1; then
+            echo "Warning: non-JSON response: $(echo "$ISSUES_RESPONSE" | head -1)"
         else
-            ISSUE_COUNT=$(echo "$ISSUES_RESPONSE" | jq 'if type == "array" then length elif .data then (.data | length) else 0 end' 2>/dev/null || echo "unknown")
+            ISSUE_COUNT=$(echo "$ISSUES_RESPONSE" | jq 'length' 2>/dev/null || echo "unknown")
             echo "Total Issues : $ISSUE_COUNT"
             echo " "
-            echo "$ISSUES_RESPONSE" | jq . 2>/dev/null || echo "$ISSUES_RESPONSE"
+            echo "$ISSUES_RESPONSE" | jq '.[] | {
+              id: ._id,
+              title,
+              severity,
+              status,
+              category,
+              endpoint: .endpoint_path
+            }' 2>/dev/null || echo "$ISSUES_RESPONSE" | jq .
         fi
         echo "==========================="
     elif [ "$STATUS" == "FAILED" ]; then
         FAILED_STEPS=$(echo "$STATUS_RESPONSE" | jq -r '.failed_steps | join(", ")')
         echo "Error: Chain execution failed. Failed steps: $FAILED_STEPS"
-        echo "Raw response: $STATUS_RESPONSE"
+        echo " "
+        echo "===== Failure Details ====="
+        echo "$STATUS_RESPONSE" | jq '{
+          chain_execution_id,
+          status,
+          failed_steps,
+          completed_steps,
+          current_step_id,
+          step_run_ids,
+          completed_at,
+          terminal_session_id
+        }' 2>/dev/null || echo "$STATUS_RESPONSE"
+        echo "==========================="
+
+        FAIL_TERMINAL_ID=$(echo "$STATUS_RESPONSE" | jq -r '.terminal_session_id // empty')
+        if [ -n "$FAIL_TERMINAL_ID" ] && [ "$FAIL_TERMINAL_ID" != "null" ]; then
+            echo " "
+            echo "===== Terminal Logs (session: $FAIL_TERMINAL_ID) ====="
+            TERMINAL_LOGS=$(curl -s --location \
+              "https://api.perfai.ai/api/v1/terminal-sessions/${FAIL_TERMINAL_ID}/logs" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "x-org-id: $ORG_ID" \
+              -H "accept: application/json")
+            if echo "$TERMINAL_LOGS" | jq -e . >/dev/null 2>&1; then
+                echo "$TERMINAL_LOGS" | jq .
+            else
+                echo "$TERMINAL_LOGS"
+            fi
+            echo "======================================================"
+        fi
+
         exit 1
     else
         echo "Chain execution ended with unexpected status: $STATUS"
-        echo "Raw response: $STATUS_RESPONSE"
+        echo " "
+        echo "===== Unexpected Response ====="
+        echo "$STATUS_RESPONSE" | jq '.' 2>/dev/null || echo "$STATUS_RESPONSE"
+        echo "==============================="
         exit 1
     fi
 else
