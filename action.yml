@@ -5,7 +5,7 @@ author: PerfAI, Inc.
 branding:
   icon: trending-up
   color: red
-      
+
 inputs:
   username:
     description: 'PerfAI Username'
@@ -13,62 +13,39 @@ inputs:
   password:
     description: 'PerfAI Password'
     required: true
-  openApiUrl:
-    description: 'OpenAPI Specification/Swagger/Bulk/Zip URLs'
+  orgId:
+    description: 'Organization ID'
     required: true
-  basePath:
-    description: 'Server base path for the API'
+  catalogId:
+    description: 'Catalog ID used for chain execution (security scan)'
     required: true
   appId:
-    description: 'API Id generated for PerfAI'
+    description: 'App ID used for fetching security issues'
     required: true
-  label:
-    description: 'API label name'
-    required: true
-  orgId:
-    description: 'ORG ID'
-    required: true  
-  # services:
-  #   description: 'Services Name'
-  #   required: true
   wait-for-completion:
-    description: 'To wait till PerfAI tests complete, set to `true`'
+    description: 'Wait until PerfAI scan completes. Set to `true` to block until done.'
     required: false
     default: "true"
   fail-on-new-leaks:
-    description: 'To fail the build on new leaks introduced with this commit, set to `true`.'
+    description: 'Fail the build if new security leaks are found. Set to `true` to enable.'
     required: false
     default: "false"
-  authenticationUrl1:
-    description: 'Authentication URL for Test Account 1'
-    required: false
-  authenticationBody1:
-    description: 'Authentication body for Test Account 1'
-    required: false   
-  authorizationHeaders1:
-    description: 'Authorization headers for authentication 1' 
-    required: false
-  authenticationUrl2:
-    description: 'Authentication URL for Test Account 2'
-    required: false
-  authenticationBody2:
-    description: 'Authentication body for Test Account 2'
-    required: false
-  authorizationHeaders2:
-    description: 'Authorization headers for authentication 2'
-    required: false
-  appUrl:
-    description: 'Application URL for Vision Agent to scan and generate API spec'
-    required: false
 
 runs:
   using: "composite"
   steps:
-    - name: Grant execute permission for action-run.sh
+    - name: Grant execute permission for multiple-service-deploy.sh
       run: chmod +x ${GITHUB_ACTION_PATH}/multiple-service-deploy.sh
       shell: bash
-      
-    - name: Run multiple-service-deploy.sh
+
+    - name: Run PerfAI Security Scan
       run: |
-        ${GITHUB_ACTION_PATH}/multiple-service-deploy.sh --username "${{ inputs.username }}" --password "${{ inputs.password }}" --openApiUrl "${{ inputs.openApiUrl }}" --basePath "${{ inputs.basePath }}" --appId "${{ inputs.appId }}" --label "${{ inputs.label }}" --orgId "${{ inputs.orgId }}" --wait-for-completion "${{ inputs.wait-for-completion }}" --fail-on-new-leaks "${{ inputs.fail-on-new-leaks }}" --authenticationUrl1 "${{ inputs.authenticationUrl1 }}" --authenticationBody1 "${{ inputs.authenticationBody1 }}" --authorizationHeaders1 "${{ inputs.authorizationHeaders1 }}" --authenticationUrl2 "${{ inputs.authenticationUrl2 }}" --authenticationBody2 "${{ inputs.authenticationBody2 }}" --authorizationHeaders2 "${{ inputs.authorizationHeaders2 }}" --appUrl "${{ inputs.appUrl }}"
+        ${GITHUB_ACTION_PATH}/multiple-service-deploy.sh \
+          --username "${{ inputs.username }}" \
+          --password "${{ inputs.password }}" \
+          --orgId "${{ inputs.orgId }}" \
+          --catalogId "${{ inputs.catalogId }}" \
+          --appId "${{ inputs.appId }}" \
+          --wait-for-completion "${{ inputs.wait-for-completion }}" \
+          --fail-on-new-leaks "${{ inputs.fail-on-new-leaks }}"
       shell: bash
