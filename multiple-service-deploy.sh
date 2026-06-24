@@ -5,7 +5,7 @@ WAIT_FOR_COMPLETION=true
 FAIL_ON_NEW_LEAKS=false
 
 # Parse the input arguments
-TEMP=$(getopt -n "$0" -a -l "hostname:,username:,password:,openApiUrl:,basePath:,orgId:,appId:,label:,wait-for-completion:,fail-on-new-leaks:,authenticationUrl1:,authenticationBody1:,authorizationHeaders1:,authenticationUrl2:,authenticationBody2:,authorizationHeaders2:,appUrl:" -- -- "$@")
+TEMP=$(getopt -n "$0" -a -l "hostname:,username:,password:,openApiUrl:,basePath:,orgId:,appId:,catalogId:,label:,wait-for-completion:,fail-on-new-leaks:,authenticationUrl1:,authenticationBody1:,authorizationHeaders1:,authenticationUrl2:,authenticationBody2:,authorizationHeaders2:,appUrl:" -- -- "$@")
 
 [ $? -eq 0 ] || exit
 
@@ -21,6 +21,7 @@ do
         --basePath) BASE_PATH="$2"; shift;;  
         --orgId) ORG_ID="$2"; shift;;
         --appId) APP_ID="$2"; shift;;
+        --catalogId) CATALOG_ID="$2"; shift;;
         --label) LABEL="$2"; shift;;
         --wait-for-completion) WAIT_FOR_COMPLETION="$2"; shift;;
         --fail-on-new-leaks) FAIL_ON_NEW_LEAKS="$2"; shift;;
@@ -69,160 +70,45 @@ fi
 echo "Access Token is: $ACCESS_TOKEN"
 echo " "
 
-### Step 2: Trigger Vision Agent Scan ###
-if [ -n "$APP_URL" ]; then
-    echo "Triggering Vision Agent Scan for URL: $APP_URL"
-    echo " "
-
-    VISION_TASK_RESPONSE=$(curl -s --location --request POST "https://api.perfai.ai/api/v1/vision-agent-tasks/create-task" \
-      -H "Authorization: Bearer $ACCESS_TOKEN" \
-      -H "x-org-id: $ORG_ID" \
-      -H "Content-Type: application/json" \
-      -d "{
-        \"type\": \"GENERATE_SPEC\",
-        \"org_id\": \"${ORG_ID}\",
-        \"app_id\": \"${APP_ID}\",
-        \"data\": {
-          \"url\": \"${APP_URL}\"
-        }
-      }")
-
-    echo "Vision Task Response: $VISION_TASK_RESPONSE"
-    echo " "
-
-    VISION_TASK_ID=$(echo "$VISION_TASK_RESPONSE" | jq -r '._id')
-
-    if [ -z "$VISION_TASK_ID" ] || [ "$VISION_TASK_ID" == "null" ]; then
-        echo "Error: Failed to create vision agent task. No task ID returned."
-        exit 1
-    fi
-
-    echo "Vision Agent Task ID: $VISION_TASK_ID"
-
-    if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
-        VISION_TIMEOUT_MINUTES=${VISION_TIMEOUT_MINUTES:-60}
-        echo "Waiting for vision agent scan to complete (timeout: ${VISION_TIMEOUT_MINUTES}m)..."
-
-        VISION_STATUS="PENDING"
-        VISION_LAST_SNAPSHOT=""
-        VISION_EMPTY_RETRIES=0
-        VISION_MAX_EMPTY_RETRIES=5
-        VISION_START_TIME=$(date +%s)
-        VISION_POLL_COUNT=0
-        VISION_HEARTBEAT_INTERVAL=10  # print a heartbeat every N polls (~5 min at 30s/poll)
-
-        while [[ "$VISION_STATUS" == "PENDING" || "$VISION_STATUS" == "IN_PROGRESS" ]]; do
-            sleep 30
-
-            VISION_ELAPSED=$(( ($(date +%s) - VISION_START_TIME) / 60 ))
-            if [ "$VISION_ELAPSED" -ge "$VISION_TIMEOUT_MINUTES" ]; then
-                echo "Error: Vision agent scan exceeded timeout of ${VISION_TIMEOUT_MINUTES}m. Last status: $VISION_STATUS. Aborting."
-                exit 1
-            fi
-
-            VISION_STATUS_RESPONSE=$(curl -s --location --request GET \
-              "https://api.perfai.ai/api/v1/vision-agent-tasks/get-task/${VISION_TASK_ID}" \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "x-org-id: $ORG_ID")
-
-            if [ -z "$VISION_STATUS_RESPONSE" ] || [ "$VISION_STATUS_RESPONSE" == "null" ] || ! echo "$VISION_STATUS_RESPONSE" | jq -e . >/dev/null 2>&1; then
-                VISION_EMPTY_RETRIES=$((VISION_EMPTY_RETRIES + 1))
-                FIRST_LINE=$(echo "$VISION_STATUS_RESPONSE" | head -1)
-                echo "[$(date '+%H:%M:%S')] Warning: non-JSON or empty response from vision agent API (attempt $VISION_EMPTY_RETRIES/$VISION_MAX_EMPTY_RETRIES): $FIRST_LINE"
-                if [ "$VISION_EMPTY_RETRIES" -ge "$VISION_MAX_EMPTY_RETRIES" ]; then
-                    echo "Error: vision agent API returned bad response $VISION_MAX_EMPTY_RETRIES times in a row. Aborting."
-                    exit 1
-                fi
-                sleep 30
-                continue
-            fi
-
-            VISION_EMPTY_RETRIES=0
-            VISION_POLL_COUNT=$((VISION_POLL_COUNT + 1))
-            VISION_STATUS=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.status // empty')
-
-            if [ -z "$VISION_STATUS" ] || [ "$VISION_STATUS" == "null" ]; then
-                echo "[$(date '+%H:%M:%S')] Warning: status field missing in vision response. Raw: $VISION_STATUS_RESPONSE"
-                continue
-            fi
-
-            VISION_IS_ERROR=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.isError')
-            VISION_MESSAGE=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.message // "N/A"')
-            VISION_SNAPSHOT="${VISION_STATUS}|${VISION_IS_ERROR}|${VISION_MESSAGE}"
-
-            # Print on every status change OR as a periodic heartbeat so the log never goes silent
-            if [ "$VISION_SNAPSHOT" != "$VISION_LAST_SNAPSHOT" ] || [ $((VISION_POLL_COUNT % VISION_HEARTBEAT_INTERVAL)) -eq 0 ]; then
-                echo "[$(date '+%H:%M:%S')] Elapsed: ${VISION_ELAPSED}m | Vision Agent Status: $VISION_STATUS | Error: $VISION_IS_ERROR | Message: $VISION_MESSAGE"
-                VISION_LAST_SNAPSHOT="$VISION_SNAPSHOT"
-            fi
-        done
-
-        if [ "$VISION_STATUS" == "COMPLETED" ]; then
-            echo "Vision agent scan completed successfully."
-            echo " "
-
-            ### Fetch generated OAS from vision-agent controller ###
-            echo "===== Vision Agent — Generated OAS ====="
-            OAS_RESPONSE=$(curl -s --location \
-              "https://api.perfai.ai/api/v1/vision-agent/oas/${VISION_TASK_ID}" \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "x-org-id: $ORG_ID" \
-              -H "accept: application/json")
-
-            if [ -z "$OAS_RESPONSE" ] || ! echo "$OAS_RESPONSE" | jq -e . >/dev/null 2>&1; then
-                echo "Warning: could not fetch OAS. Response: $(echo "$OAS_RESPONSE" | head -1)"
-            else
-                ENDPOINT_COUNT=$(echo "$OAS_RESPONSE" | jq '[.paths // {} | to_entries[] | .value | to_entries[]] | length' 2>/dev/null || echo "unknown")
-                OAS_TITLE=$(echo "$OAS_RESPONSE" | jq -r '.info.title // "N/A"')
-                OAS_VERSION=$(echo "$OAS_RESPONSE" | jq -r '.info.version // "N/A"')
-                echo "Title           : $OAS_TITLE"
-                echo "Version         : $OAS_VERSION"
-                echo "Endpoints found : $ENDPOINT_COUNT"
-                echo " "
-                echo "$OAS_RESPONSE" | jq '{info: .info, paths: (.paths // {})}' 2>/dev/null || echo "$OAS_RESPONSE"
-            fi
-            echo "========================================"
-            echo " "
-
-            ### Fetch step logs from vision-agent controller ###
-            echo "===== Vision Agent — Step Logs ====="
-            STEPS_RESPONSE=$(curl -s --location \
-              "https://api.perfai.ai/api/v1/vision-agent/save-captures/${VISION_TASK_ID}/steps" \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "x-org-id: $ORG_ID" \
-              -H "accept: application/json")
-
-            if [ -z "$STEPS_RESPONSE" ] || ! echo "$STEPS_RESPONSE" | jq -e . >/dev/null 2>&1; then
-                echo "Warning: could not fetch step logs. Response: $(echo "$STEPS_RESPONSE" | head -1)"
-            else
-                STEP_COUNT=$(echo "$STEPS_RESPONSE" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "unknown")
-                echo "Total steps : $STEP_COUNT"
-                echo "$STEPS_RESPONSE" | jq . 2>/dev/null || echo "$STEPS_RESPONSE"
-            fi
-            echo "===================================="
-            echo " "
-
-        elif [ "$VISION_STATUS" == "FAILED" ] || [ "$VISION_STATUS" == "ABORTED" ]; then
-            echo "Error: Vision agent scan ended with status: $VISION_STATUS. Message: $VISION_MESSAGE"
-            echo "Full response: $VISION_STATUS_RESPONSE"
-            exit 1
-        else
-            echo "Vision agent scan ended with unexpected status: $VISION_STATUS"
-            exit 1
-        fi
-    else
-        echo "Vision agent scan triggered. Task ID: $VISION_TASK_ID. Continuing without waiting."
-    fi
-
-    echo " "
-fi
+### Step 2: Trigger Vision Agent Scan (disabled) ###
+# VISION_TASK_RESPONSE=$(curl -s --location --request POST "https://api.perfai.ai/api/v1/vision-agent-tasks/create-task" \
+#   -H "Authorization: Bearer $ACCESS_TOKEN" \
+#   -H "x-org-id: $ORG_ID" \
+#   -H "Content-Type: application/json" \
+#   -d "{
+#     \"type\": \"GENERATE_SPEC\",
+#     \"org_id\": \"${ORG_ID}\",
+#     \"app_id\": \"${CATALOG_ID}\",
+#     \"data\": {
+#       \"url\": \"${APP_URL}\"
+#     }
+#   }")
+#
+# VISION_TASK_ID=$(echo "$VISION_TASK_RESPONSE" | jq -r '._id')
+#
+# if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
+#     VISION_STATUS="PENDING"
+#     VISION_START_TIME=$(date +%s)
+#     VISION_POLL_COUNT=0
+#     VISION_HEARTBEAT_INTERVAL=10
+#
+#     while [[ "$VISION_STATUS" == "PENDING" || "$VISION_STATUS" == "IN_PROGRESS" ]]; do
+#         sleep 30
+#         VISION_ELAPSED=$(( ($(date +%s) - VISION_START_TIME) / 60 ))
+#         VISION_STATUS_RESPONSE=$(curl -s --location --request GET \
+#           "https://api.perfai.ai/api/v1/vision-agent-tasks/get-task/${VISION_TASK_ID}" \
+#           -H "Authorization: Bearer $ACCESS_TOKEN" \
+#           -H "x-org-id: $ORG_ID")
+#         VISION_STATUS=$(echo "$VISION_STATUS_RESPONSE" | jq -r '.status // empty')
+#     done
+# fi
 
 ### Step 3: Trigger sensitive_data_run via chain execution ###
 RUN_RESPONSE=$(curl -s --location --request POST "https://api.perfai.ai/chain-execution/execute" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
-    \"catalog_id\": \"${APP_ID}\",
+    \"catalog_id\": \"${CATALOG_ID}\",
     \"chain_config\": {
       \"steps\": [
         {
@@ -292,7 +178,7 @@ echo " "
 
 ### Step 4: Check the wait-for-completion flag ###
 if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
-    echo "Waiting for sensitive_data_run to complete (this typically takes 45–90 min for full scan)..."
+    echo "Waiting for sensitive_data_run to complete (this typically takes 5 min for full scan)..."
 
     STATUS="PENDING"
     LAST_SNAPSHOT=""
@@ -348,7 +234,7 @@ if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
 
     if [[ "$STATUS" == "COMPLETED" || "$STATUS" == "DONE" || "$STATUS" == "SUCCESS" ]]; then
         ELAPSED_TOTAL=$(( ($(date +%s) - CHAIN_START_TIME) / 60 ))
-        echo "sensitive_data_run completed successfully for catalog ID $APP_ID (elapsed: ${ELAPSED_TOTAL}m)."
+        echo "sensitive_data_run completed successfully for catalog ID $CATALOG_ID (elapsed: ${ELAPSED_TOTAL}m)."
         echo " "
         echo "===== Security Scan Results ====="
         echo "Chain Execution ID : $CHAIN_EXECUTION_ID"
@@ -362,30 +248,53 @@ if [ "$WAIT_FOR_COMPLETION" == "true" ]; then
         echo "================================="
         echo " "
 
-        ### Fetch Security Issues ###
+        ### Fetch Security Issues — poll for up to 5 minutes until issues appear ###
         echo "===== Security Issues ====="
-        ISSUES_RESPONSE=$(curl -s --location \
-          "https://api.perfai.ai/api/v1/sensitive-data-service/apps/all-issues-ids-security?app_id=${APP_ID}&sortBy=severity&sortOrder=DESC" \
-          -H "Authorization: Bearer $ACCESS_TOKEN" \
-          -H "x-org-id: $ORG_ID" \
-          -H "accept: application/json")
+        ISSUES_POLL_INTERVAL=15
+        ISSUES_POLL_DEADLINE=$(( $(date +%s) + 300 ))   # 5 minutes
+        ISSUE_COUNT=0
 
-        if [ -z "$ISSUES_RESPONSE" ]; then
-            echo "Warning: empty response from security issues API."
-        elif ! echo "$ISSUES_RESPONSE" | jq -e . >/dev/null 2>&1; then
-            echo "Warning: non-JSON response: $(echo "$ISSUES_RESPONSE" | head -1)"
+        while [ "$(date +%s)" -lt "$ISSUES_POLL_DEADLINE" ]; do
+            ISSUES_RESPONSE=$(curl -s --location \
+              "https://api.perfai.ai/api/v1/sensitive-data-service/apps/app_issues_security?app_id=${APP_ID}&page=1&pageSize=100&sortBy=severity&sortOrder=DESC" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "x-org-id: $ORG_ID" \
+              -H "accept: application/json")
+
+            if [ -z "$ISSUES_RESPONSE" ] || ! echo "$ISSUES_RESPONSE" | jq -e . >/dev/null 2>&1; then
+                echo "[$(date '+%H:%M:%S')] Warning: non-JSON or empty response from security issues API. Retrying in ${ISSUES_POLL_INTERVAL}s..."
+                sleep "$ISSUES_POLL_INTERVAL"
+                continue
+            fi
+
+            ISSUE_COUNT=$(echo "$ISSUES_RESPONSE" | jq '.summary.totalCount // 0' 2>/dev/null || echo "0")
+
+            if [ "$ISSUE_COUNT" -gt 0 ] 2>/dev/null; then
+                echo "[$(date '+%H:%M:%S')] Issues ready — found $ISSUE_COUNT security issue(s)."
+                break
+            fi
+
+            REMAINING=$(( ISSUES_POLL_DEADLINE - $(date +%s) ))
+            echo "[$(date '+%H:%M:%S')] No issues yet (0 found). Retrying in ${ISSUES_POLL_INTERVAL}s (${REMAINING}s remaining)..."
+            sleep "$ISSUES_POLL_INTERVAL"
+        done
+
+        if [ "$ISSUE_COUNT" -eq 0 ] 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] No security issues found after 5 minutes. The scan may still be processing."
         else
-            ISSUE_COUNT=$(echo "$ISSUES_RESPONSE" | jq 'length' 2>/dev/null || echo "unknown")
-            echo "Total Issues : $ISSUE_COUNT"
+            CRITICAL_COUNT=$(echo "$ISSUES_RESPONSE" | jq '.summary.criticalCount // 0')
+            HIGH_COUNT=$(echo "$ISSUES_RESPONSE" | jq '.summary.highCount // 0')
+            MEDIUM_LOW_COUNT=$(echo "$ISSUES_RESPONSE" | jq '.summary.mediumLowCount // 0')
+            TOTAL_SAVINGS=$(echo "$ISSUES_RESPONSE" | jq '.summary.bugBountySavings.totalSavings // 0')
+
             echo " "
-            echo "$ISSUES_RESPONSE" | jq '.[] | {
-              id: ._id,
-              title,
-              severity,
-              status,
-              category,
-              endpoint: .endpoint_path
-            }' 2>/dev/null || echo "$ISSUES_RESPONSE" | jq .
+            echo "  Total Issues   : $ISSUE_COUNT"
+            echo "  Critical       : $CRITICAL_COUNT"
+            echo "  High           : $HIGH_COUNT"
+            echo "  Medium / Low   : $MEDIUM_LOW_COUNT"
+            echo "  Bounty Savings : \$$TOTAL_SAVINGS"
+            echo " "
+            echo "$ISSUES_RESPONSE" | jq '{summary}' 2>/dev/null
         fi
         echo "==========================="
     elif [ "$STATUS" == "FAILED" ]; then
